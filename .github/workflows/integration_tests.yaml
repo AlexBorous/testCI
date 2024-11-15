@@ -1,0 +1,193 @@
+name: Run Integration Tests
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  android-integration-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Define the device model and version matrix for testing
+        device:
+          # - model: "lynx"
+          #   version: "33" # Android 12
+          # - model: "oriole"
+          #   version: "32" # Android 11
+          # - model: "e1q"
+          #   version: "34" # Android 10
+          - model: "cheetah"
+            version: "33" # Android 13
+    env:
+      ANDROID_DEVICE_MODEL: ${{ matrix.device.model }}
+      ANDROID_DEVICE_VERSION: ${{ matrix.device.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: Mood-APIs/mobile
+          token: ${{ secrets.TESTING_ACCESS_TOKEN }}
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          cache: true
+          channel: stable
+
+      - name: Change pub URL
+        run: |
+          chmod +x change_pub.sh
+          ./change_pub.sh https://AlexBorous:${{secrets.TESTING_ACCESS_TOKEN}}@github.com/Mood-APIs/mood_sdk
+
+      - uses: actions/setup-java@v3
+        with:
+          cache: "gradle"
+          distribution: corretto
+          java-version: 17
+
+      - name: Setup Patrol
+        run: |
+          dart pub global activate patrol_cli
+
+      - name: "Authenticate to Google Cloud"
+        uses: "google-github-actions/auth@v1"
+        with:
+          credentials_json: "${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}"
+
+      - name: "Install gcloud"
+        uses: "google-github-actions/setup-gcloud@v2"
+        with:
+          version: ">= 416.0.0"
+
+      - name: Clean Flutter Project
+        run: |
+          flutter clean
+
+      - name: Dart Pub Get
+        run: |
+          dart pub get
+
+      - name: Flutter Pub Get
+        run: |
+          flutter pub get
+
+      - name: Build Android app with verbose logs
+        run: |
+          patrol build android  --verbose
+
+      - name: Run tests on Firebase Test Lab
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
+          GITHUB_TOKEN: ${{ secrets.TESTING_ACCESS_TOKEN }}
+        run: |
+          gcloud firebase test android run --type instrumentation --use-orchestrator --app build/app/outputs/apk/debug/app-debug.apk --test build/app/outputs/apk/androidTest/debug/app-debug-androidTest.apk --device model="${ANDROID_DEVICE_MODEL}",version="${ANDROID_DEVICE_VERSION}",locale=en,orientation=portrait --timeout 1m --environment-variables clearPackageData=true
+
+  ios-integration-tests:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        device:
+          - model: "iphone11pro"
+            version: "16.6" # iOS 16
+          # - model: "iphone14pro"
+          #   version: "16.6" # iOS 16
+          # - model: "iphone13pro"
+          #   version: "15.7" # iOS 15
+    env:
+      DEVICE_MODEL: ${{ matrix.device.model }}
+      DEVICE_VERSION: ${{ matrix.device.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: Mood-APIs/mobile
+          token: ${{ secrets.TESTING_ACCESS_TOKEN }}
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Patrol
+        run: |
+          dart pub global activate patrol_cli
+
+      - id: "auth"
+        uses: "google-github-actions/auth@v1"
+        with:
+          credentials_json: "${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}"
+
+      - uses: "google-github-actions/setup-gcloud@v2"
+        with:
+          version: ">= 416.0.0"
+
+      - name: Install CocoaPods
+        run: brew install cocoapods
+
+      - name: Change pub URL
+        run: |
+          chmod +x change_pub.sh
+          ./change_pub.sh https://AlexBorous:${{secrets.TESTING_ACCESS_TOKEN}}@github.com/Mood-APIs/mood_sdk
+      # Setup Ruby, Bundler, and Gemfile dependencies
+      - name: Setup Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "2.6"
+          bundler-cache: true
+          working-directory: ios
+
+      - name: Bundle install
+        run: cd ./ios && bundle install
+
+      - name: Clean Flutter Project
+        run: |
+          flutter clean
+
+      - name: Dart Pub Get
+        run: |
+          dart pub get
+
+      - name: Flutter Pub Get
+        run: |
+          flutter pub get
+
+      - name: Build test config
+        run: flutter build ios --config-only
+
+      - name: Sign the app using fastlane
+        run: cd ./ios && bundle exec fastlane sign
+        env:
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+          MATCH_KEYCHAIN_PASSWORD: ${{ secrets.MATCH_KEYCHAIN_PASSWORD }}
+          MATCH_KEYCHAIN_NAME: ${{ secrets.MATCH_KEYCHAIN_NAME }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+
+      - name: Build iOS app for integration tests
+        env:
+          GITHUB_TOKEN: ${{ secrets.TESTING_ACCESS_TOKEN }}
+        run: |
+          patrol build ios --release --verbose
+
+      - name: Prepare iOS Test Files
+        run: |
+          cd build/ios_integ/Build/Products
+          rm -f ios_tests.zip
+          zip -r ios_tests.zip Release-iphoneos/*.app *.xctestrun
+          cd -
+
+      - name: Run tests on Firebase Test Lab
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}
+        run: |
+          gcloud firebase test ios run 
+            --type xctest 
+            --test "build/ios_integ/Build/Products/ios_tests.zip" 
+            --device model="${DEVICE_MODEL}",version="${DEVICE_VERSION}",locale=en_US,orientation=portrait 
+            --timeout 10m
